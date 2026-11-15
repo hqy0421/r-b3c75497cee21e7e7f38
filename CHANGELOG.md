@@ -1,3 +1,10 @@
+# Unreleased
+
+ - New collector option: Collector.OrderedAsync
+   Async crawling which keeps the response callbacks in the order of a
+   serial breadth-first traversal, deduplicates the URLs per crawl round
+   and bounds the number of in-flight and unpublished results.
+
 # 2.1.0 - 2020.06.09
 
  - HTTP tracing support

@@ -498,6 +498,29 @@ var newCollectorTests = map[string]func(*testing.T){
 			t.Fatal("c.Async = false, want true")
 		}
 	},
+	"OrderedAsync": func(t *testing.T) {
+		for _, lookahead := range []int{
+			0,
+			1,
+			4,
+		} {
+			c := NewCollector(OrderedAsync(lookahead))
+
+			if !c.Async {
+				t.Fatalf("lookahead %d: c.Async = false, want true", lookahead)
+			}
+			if !c.OrderedAsync {
+				t.Fatalf("lookahead %d: c.OrderedAsync = false, want true", lookahead)
+			}
+			want := lookahead
+			if want <= 0 {
+				want = defaultOrderedLookahead
+			}
+			if c.Lookahead != want {
+				t.Fatalf("lookahead %d: c.Lookahead = %d, want %d", lookahead, c.Lookahead, want)
+			}
+		}
+	},
 }
 
 func TestNoAcceptHeader(t *testing.T) {

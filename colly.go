@@ -100,6 +100,23 @@ type Collector struct {
 	// Async turns on asynchronous network communication. Use Collector.Wait() to
 	// be sure all requests have been finished.
 	Async bool
+	// OrderedAsync turns on asynchronous network communication while keeping the
+	// order of the response callbacks identical to a serial breadth-first
+	// traversal. Each URL is processed at most once per crawl round, a URL
+	// discovered by several pages belongs to the first discoverer in traversal
+	// order, and a slow page is never overtaken by later pages.
+	// Use Collector.Wait() to wait for the publication of the results.
+	//
+	// The ordered callbacks are OnError, OnResponse, OnHTML, OnXML and
+	// OnScraped. OnRequest, OnRequestHeaders and OnResponseHeaders still run on
+	// the goroutine which performs the download, so links discovered there and
+	// redirect targets are not part of the ordering guarantee. Ordered mode is
+	// not meant to be combined with queue.Queue, whose consumer threads issue
+	// the requests concurrently.
+	OrderedAsync bool
+	// Lookahead limits the number of started but not yet published requests in
+	// OrderedAsync mode. The default is 8; values <= 0 select the default.
+	Lookahead int
 	// ParseHTTPErrorResponse allows parsing HTTP responses with non 2xx status codes.
 	// By default, Colly parses only successful HTTP responses. Set ParseHTTPErrorResponse
 	// to true to enable it.
@@ -140,6 +157,7 @@ type Collector struct {
 	backend                  *httpBackend
 	wg                       *sync.WaitGroup
 	lock                     *sync.RWMutex
+	order                    *orderState
 	// CacheExpiration sets the maximum age for cache files.
 	// If a cached file is older than this duration, it will be ignored and refreshed.
 	CacheExpiration time.Duration
@@ -464,6 +482,20 @@ func Async(a ...bool) CollectorOption {
 	}
 }
 
+// OrderedAsync turns on asynchronous network requests while preserving the
+// order of the response callbacks of a serial breadth-first traversal.
+// The optional lookahead argument limits the number of started but not yet
+// published requests. It defaults to 8.
+func OrderedAsync(lookahead ...int) CollectorOption {
+	return func(c *Collector) {
+		c.Async = true
+		c.OrderedAsync = true
+		if len(lookahead) > 0 && lookahead[0] > 0 {
+			c.Lookahead = lookahead[0]
+		}
+	}
+}
+
 // DetectCharset enables character encoding detection for non-utf8 response bodies
 // without explicit charset declaration. This feature uses https://github.com/saintfish/chardet
 func DetectCharset() CollectorOption {
@@ -511,10 +543,12 @@ func (c *Collector) Init() {
 	c.backend.Client.CheckRedirect = c.checkRedirectFunc()
 	c.wg = &sync.WaitGroup{}
 	c.lock = &sync.RWMutex{}
+	c.order = newOrderState()
 	c.robotsMap = make(map[string]*robotstxt.RobotsData)
 	c.IgnoreRobotsTxt = true
 	c.ID = atomic.AddUint32(&collectorCounter, 1)
 	c.TraceHTTP = false
+	c.Lookahead = defaultOrderedLookahead
 	c.Context = context.Background()
 }
 
@@ -543,6 +577,16 @@ func (c *Collector) Appengine(ctx context.Context) {
 // request to the URL specified in parameter.
 // Visit also calls the previously provided callbacks
 func (c *Collector) Visit(URL string) error {
+	if c.CheckHead && c.orderedActive() {
+		// The GET is admitted by the coordinator after the HEAD has been
+		// published, so that derived links keep the traversal order and the
+		// GET is skipped when the HEAD fails.
+		return c.scrapeNext(URL, "HEAD", 1, nil, nil, nil, true, func(err error) {
+			if err == nil {
+				c.scrape(URL, "GET", 1, nil, nil, nil, true)
+			}
+		})
+	}
 	if c.CheckHead {
 		if check := c.scrape(URL, "HEAD", 1, nil, nil, nil, true); check != nil {
 			return check
@@ -642,6 +686,13 @@ func (c *Collector) UnmarshalRequest(r []byte) (*Request, error) {
 }
 
 func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, checkRevisit bool) error {
+	return c.scrapeNext(u, method, depth, requestData, ctx, hdr, checkRevisit, nil)
+}
+
+// scrapeNext builds a request and either starts it right away or admits it to
+// the ordered scheduler. next, when not nil, is called with the publication
+// error after the ordered publication of the request.
+func (c *Collector) scrapeNext(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, checkRevisit bool, next func(error)) error {
 	parsedWhatwgURL, err := urlParser.Parse(u)
 	if err != nil {
 		return err
@@ -684,22 +735,52 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	// replace this with http.NewRequestWithContext
 	req = req.WithContext(context.WithValue(c.Context, CheckRevisitKey, checkRevisit))
 
-	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
+	checkRevisitRequestCheck := checkRevisit
+	if c.orderedActive() {
+		// Revisit claims are evaluated at ordered admission, where they are
+		// serialized with the other admissions.
+		checkRevisitRequestCheck = false
+	}
+	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisitRequestCheck); err != nil {
 		return err
 	}
-	u = parsedURL.String()
+	if c.orderedActive() {
+		return c.admitOrdered(parsedURL, method, depth, requestData, ctx, req, checkRevisit, next)
+	}
 	c.wg.Add(1)
 	if c.Async {
-		go c.fetch(u, method, depth, requestData, ctx, hdr, req)
+		go c.fetch(method, depth, requestData, ctx, req)
 		return nil
 	}
-	return c.fetch(u, method, depth, requestData, ctx, hdr, req)
+	return c.fetch(method, depth, requestData, ctx, req)
 }
 
-func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, req *http.Request) error {
+func (c *Collector) fetch(method string, depth int, requestData io.Reader, ctx *Context, req *http.Request) error {
 	defer c.wg.Done()
+	return c.publish(c.dispatch(method, depth, requestData, ctx, req, 0))
+}
+
+// fetchOutcome holds the result of the download phase of a request. It is
+// passed to the publish phase either inline or, in ordered mode, across the
+// scheduler's lock so that the publication order stays deterministic.
+type fetchOutcome struct {
+	request  *Request
+	response *Response
+	trace    *HTTPTrace
+	ctx      *Context
+	err      error
+	aborted  bool
+}
+
+// dispatch performs the download phase of a request: the request and
+// response-header callbacks plus the network transfer. A zero requestID
+// makes the request ID be assigned here, as in the regular fetch path.
+func (c *Collector) dispatch(method string, depth int, requestData io.Reader, ctx *Context, req *http.Request, requestID uint32) *fetchOutcome {
 	if ctx == nil {
 		ctx = NewContext()
+	}
+	if requestID == 0 {
+		requestID = c.requestCount.Add(1)
 	}
 	request := &Request{
 		URL:       req.URL,
@@ -710,7 +791,7 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		Method:    method,
 		Body:      requestData,
 		collector: c,
-		ID:        c.requestCount.Add(1),
+		ID:        requestID,
 	}
 
 	if req.Header.Get("Accept") == "" {
@@ -720,7 +801,7 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	c.handleOnRequest(request)
 
 	if request.abort {
-		return nil
+		return &fetchOutcome{request: request, ctx: ctx, aborted: true}
 	}
 
 	if method == "POST" && req.Header.Get("Content-Type") == "" {
@@ -749,15 +830,31 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
 	}
-	if err := c.handleOnError(response, err, request, ctx); err != nil {
+	return &fetchOutcome{
+		request:  request,
+		response: response,
+		trace:    hTrace,
+		ctx:      ctx,
+		err:      err,
+	}
+}
+
+// publish runs the response callbacks for a completed download. It returns
+// the same error the regular fetch path returns.
+func (c *Collector) publish(o *fetchOutcome) error {
+	if o.aborted {
+		return nil
+	}
+	request, ctx, response := o.request, o.ctx, o.response
+	if err := c.handleOnError(response, o.err, request, ctx); err != nil {
 		return err
 	}
 	c.responseCount.Add(1)
 	response.Ctx = ctx
 	response.Request = request
-	response.Trace = hTrace
+	response.Trace = o.trace
 
-	err = response.fixCharset(c.DetectCharset, request.ResponseCharacterEncoding)
+	err := response.fixCharset(c.DetectCharset, request.ResponseCharacterEncoding)
 	if err != nil {
 		return err
 	}
@@ -936,9 +1033,15 @@ func (c *Collector) String() string {
 	)
 }
 
-// Wait returns when the collector jobs are finished
+// Wait returns when the collector jobs are finished.
+//
+// In ordered mode it waits for the publication of the results and for the
+// requests derived by the response callbacks as well.
 func (c *Collector) Wait() {
 	c.wg.Wait()
+	if c.orderedActive() {
+		c.waitOrdered()
+	}
 }
 
 // OnRequest registers a function. Function will be executed on every
@@ -1462,6 +1565,9 @@ func (c *Collector) Clone() *Collector {
 		backend:                c.backend,
 		debugger:               c.debugger,
 		Async:                  c.Async,
+		OrderedAsync:           c.OrderedAsync,
+		Lookahead:              c.Lookahead,
+		order:                  newOrderState(),
 		redirectHandler:        c.redirectHandler,
 		errorCallbacks:         make([]ErrorCallback, 0, 8),
 		htmlCallbacks:          make([]*htmlCallbackContainer, 0, 8),

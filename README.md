@@ -59,6 +59,7 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Manages request delays and maximum concurrency per domain
 -   Automatic cookie and session handling
 -   Sync/async/parallel scraping
+-   Ordered async scraping with a serial breadth-first callback order and a bounded lookahead
 -   Caching
 -   Automatic encoding of non-unicode responses
 -   Robots.txt support
